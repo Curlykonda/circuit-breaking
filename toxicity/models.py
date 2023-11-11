@@ -1,8 +1,8 @@
 import pickle
 
 import torch
-from easy_transformer import EasyTransformer
 from transformer import Config, DemoTransformer
+from transformer_lens import EasyTransformer
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
