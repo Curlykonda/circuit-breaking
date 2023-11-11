@@ -1,0 +1,6 @@
+transformers
+matplotlib
+datasets
+seaborn
+torch
+transformer-lens==1.10.0
