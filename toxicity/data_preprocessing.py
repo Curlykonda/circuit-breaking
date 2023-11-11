@@ -73,7 +73,6 @@ def get_data(
     num_test_samples=0,
     num_buckets=None,
 ):
-
     # filter for text over 20 characters
     toxicity_scores = [x for x in toxicity_scores if len(filter_text(x[2])) > 20]
 

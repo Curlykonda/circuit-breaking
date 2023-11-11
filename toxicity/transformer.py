@@ -3,17 +3,15 @@ A modified version of the transformer architecture to enable casaul path
 interventions. Modified from Nanda.
 """
 
-# %% 
-import pickle
-import einops
-from fancy_einsum import einsum
+import math
 from dataclasses import dataclass
+
+import einops
 import torch
 import torch.nn as nn
-import numpy as np
-import math
-from easy_transformer.utils import gelu_new
-import tqdm.auto as tqdm
+from fancy_einsum import einsum
+from transformer_lens.utils import gelu_new
+
 
 @dataclass
 class Config:
@@ -28,7 +26,9 @@ class Config:
     n_heads: int = 12
     n_layers: int = 12
 
+
 cfg = Config()
+
 
 class LayerNorm(nn.Module):
     def __init__(self, cfg):
@@ -36,26 +36,32 @@ class LayerNorm(nn.Module):
         self.cfg = cfg
         self.w = nn.Parameter(torch.ones(cfg.d_model))
         self.b = nn.Parameter(torch.zeros(cfg.d_model))
-    
+
     def forward(self, residual, parallel=False):
         # residual: [batch, position, n_heads, d_model]
-        if self.cfg.debug: print("Residual:", residual.shape)
+        if self.cfg.debug:
+            print("Residual:", residual.shape)
         if parallel:
             pattern = "batch position n_heads d_model -> batch position n_heads 1"
         else:
             pattern = "batch position d_model -> batch position 1"
         residual = residual - einops.reduce(residual, pattern, "mean")
         # Calculate the variance, square root it. Add in an epsilon to prevent divide by zero.
-        scale = (einops.reduce(residual.pow(2), pattern, "mean") + cfg.layer_norm_eps).sqrt()
+        scale = (
+            einops.reduce(residual.pow(2), pattern, "mean") + cfg.layer_norm_eps
+        ).sqrt()
         normalized = residual / scale
         normalized = normalized * self.w + self.b
-        if self.cfg.debug: print("Normalized:", residual.shape)
+        if self.cfg.debug:
+            print("Normalized:", residual.shape)
         return normalized
+
 
 """## Embedding
 
 Basically a lookup table from tokens to residual stream vectors.
 """
+
 
 class Embed(nn.Module):
     def __init__(self, cfg):
@@ -63,15 +69,19 @@ class Embed(nn.Module):
         self.cfg = cfg
         self.W_E = nn.Parameter(torch.empty((cfg.d_vocab, cfg.d_model)))
         nn.init.normal_(self.W_E, std=self.cfg.init_range)
-    
+
     def forward(self, tokens):
         # tokens: [batch, position]
-        if self.cfg.debug: print("Tokens:", tokens.shape)
-        embed = self.W_E[tokens, :] # [batch, position, d_model]
-        if self.cfg.debug: print("Embeddings:", embed.shape)
+        if self.cfg.debug:
+            print("Tokens:", tokens.shape)
+        embed = self.W_E[tokens, :]  # [batch, position, d_model]
+        if self.cfg.debug:
+            print("Embeddings:", embed.shape)
         return embed
 
+
 """## Positional Embedding"""
+
 
 class PosEmbed(nn.Module):
     def __init__(self, cfg):
@@ -79,14 +89,21 @@ class PosEmbed(nn.Module):
         self.cfg = cfg
         self.W_pos = nn.Parameter(torch.empty((cfg.n_ctx, cfg.d_model)))
         nn.init.normal_(self.W_pos, std=self.cfg.init_range)
-    
+
     def forward(self, tokens):
         # tokens: [batch, position]
-        if self.cfg.debug: print("Tokens:", tokens.shape)
-        pos_embed = self.W_pos[:tokens.size(1), :] # [position, d_model]
-        pos_embed = einops.repeat(pos_embed, "position d_model -> batch position d_model", batch=tokens.size(0))
-        if self.cfg.debug: print("pos_embed:", pos_embed.shape)
+        if self.cfg.debug:
+            print("Tokens:", tokens.shape)
+        pos_embed = self.W_pos[: tokens.size(1), :]  # [position, d_model]
+        pos_embed = einops.repeat(
+            pos_embed,
+            "position d_model -> batch position d_model",
+            batch=tokens.size(0),
+        )
+        if self.cfg.debug:
+            print("pos_embed:", pos_embed.shape)
         return pos_embed
+
 
 """## Attention
 
@@ -102,6 +119,8 @@ class PosEmbed(nn.Module):
 
 First, it's useful to visualize and play around with attention patterns - what exactly are we looking at here? (Click on a head to lock onto just showing that head's pattern, it'll make it easier to interpret)
 """
+
+
 class Attention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -115,60 +134,122 @@ class Attention(nn.Module):
         self.W_V = nn.Parameter(torch.empty((cfg.n_heads, cfg.d_model, cfg.d_head)))
         nn.init.normal_(self.W_V, std=self.cfg.init_range)
         self.b_V = nn.Parameter(torch.zeros((cfg.n_heads, cfg.d_head)))
-        
+
         self.W_O = nn.Parameter(torch.empty((cfg.n_heads, cfg.d_head, cfg.d_model)))
         nn.init.normal_(self.W_O, std=self.cfg.init_range)
-        self.b_O = nn.Parameter(torch.zeros((cfg.d_model)))
-        
-        self.register_buffer("IGNORE", torch.tensor(-1e5, dtype=torch.float32, device="cuda"))
-    
+        self.b_O = nn.Parameter(torch.zeros(cfg.d_model))
+
+        self.register_buffer(
+            "IGNORE", torch.tensor(-1e5, dtype=torch.float32, device="cuda")
+        )
+
     def forward(self, normalized_resid_pre):
         # normalized_resid_pre: [batch, position, d_model]
-        if self.cfg.debug: print("Normalized_resid_pre:", normalized_resid_pre.shape)
+        if self.cfg.debug:
+            print("Normalized_resid_pre:", normalized_resid_pre.shape)
 
-        q = einsum("batch query_pos n_heads d_model, n_heads d_model d_head -> batch query_pos n_heads d_head", normalized_resid_pre, self.W_Q) + self.b_Q
+        q = (
+            einsum(
+                "batch query_pos n_heads d_model, n_heads d_model d_head -> batch query_pos n_heads d_head",
+                normalized_resid_pre,
+                self.W_Q,
+            )
+            + self.b_Q
+        )
 
-        k = einsum("batch key_pos n_heads d_model, n_heads d_model d_head -> batch key_pos n_heads d_head", normalized_resid_pre, self.W_K) + self.b_K
-        
-        attn_scores = einsum("batch query_pos n_heads d_head, batch key_pos n_heads d_head -> batch n_heads query_pos key_pos", q, k)
+        k = (
+            einsum(
+                "batch key_pos n_heads d_model, n_heads d_model d_head -> batch key_pos n_heads d_head",
+                normalized_resid_pre,
+                self.W_K,
+            )
+            + self.b_K
+        )
+
+        attn_scores = einsum(
+            "batch query_pos n_heads d_head, batch key_pos n_heads d_head -> batch n_heads query_pos key_pos",
+            q,
+            k,
+        )
         attn_scores = attn_scores / math.sqrt(self.cfg.d_head)
         attn_scores = self.apply_causal_mask(attn_scores)
 
-        pattern = attn_scores.softmax(dim=-1) # [batch, n_head, query_pos, key_pos]
-        v = einsum("batch key_pos n_heads d_model, n_heads d_model d_head -> batch key_pos n_heads d_head", normalized_resid_pre, self.W_V) + self.b_V
+        pattern = attn_scores.softmax(dim=-1)  # [batch, n_head, query_pos, key_pos]
+        v = (
+            einsum(
+                "batch key_pos n_heads d_model, n_heads d_model d_head -> batch key_pos n_heads d_head",
+                normalized_resid_pre,
+                self.W_V,
+            )
+            + self.b_V
+        )
 
-        z = einsum("batch n_heads query_pos key_pos, batch key_pos n_heads d_head -> batch query_pos n_heads d_head", pattern, v)
+        z = einsum(
+            "batch n_heads query_pos key_pos, batch key_pos n_heads d_head -> batch query_pos n_heads d_head",
+            pattern,
+            v,
+        )
 
-        attn_out = einsum("batch query_pos n_heads d_head, n_heads d_head d_model -> batch query_pos n_heads d_model", z, self.W_O) + (self.b_O / cfg.n_heads)
+        attn_out = einsum(
+            "batch query_pos n_heads d_head, n_heads d_head d_model -> batch query_pos n_heads d_model",
+            z,
+            self.W_O,
+        ) + (self.b_O / cfg.n_heads)
         return attn_out
 
     def apply_causal_mask(self, attn_scores):
         # attn_scores: [batch, n_heads, query_pos, key_pos]
-        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1), device=attn_scores.device), diagonal=1).bool()
+        mask = torch.triu(
+            torch.ones(
+                attn_scores.size(-2), attn_scores.size(-1), device=attn_scores.device
+            ),
+            diagonal=1,
+        ).bool()
         attn_scores.masked_fill_(mask, self.IGNORE)
         return attn_scores
 
+
 """## MLP"""
+
+
 class MLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.W_in = nn.Parameter(torch.empty((cfg.d_model, cfg.d_mlp)))
         nn.init.normal_(self.W_in, std=self.cfg.init_range)
-        self.b_in = nn.Parameter(torch.zeros((cfg.d_mlp)))
+        self.b_in = nn.Parameter(torch.zeros(cfg.d_mlp))
         self.W_out = nn.Parameter(torch.empty((cfg.d_mlp, cfg.d_model)))
         nn.init.normal_(self.W_out, std=self.cfg.init_range)
-        self.b_out = nn.Parameter(torch.zeros((cfg.d_model)))
-    
+        self.b_out = nn.Parameter(torch.zeros(cfg.d_model))
+
     def forward(self, normalized_resid_mid):
         # normalized_resid_mid: [batch, position, d_model]
-        if self.cfg.debug: print("Normalized_resid_mid:", normalized_resid_mid.shape)
-        pre = einsum("batch position d_model, d_model d_mlp -> batch position d_mlp", normalized_resid_mid, self.W_in) + self.b_in
+        if self.cfg.debug:
+            print("Normalized_resid_mid:", normalized_resid_mid.shape)
+        pre = (
+            einsum(
+                "batch position d_model, d_model d_mlp -> batch position d_mlp",
+                normalized_resid_mid,
+                self.W_in,
+            )
+            + self.b_in
+        )
         post = gelu_new(pre)
-        mlp_out = einsum("batch position d_mlp, d_mlp d_model -> batch position d_model", post, self.W_out) + self.b_out
+        mlp_out = (
+            einsum(
+                "batch position d_mlp, d_mlp d_model -> batch position d_model",
+                post,
+                self.W_out,
+            )
+            + self.b_out
+        )
         return mlp_out
 
+
 """## Transformer Block"""
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, cfg, prev_layers: int):
         super().__init__()
@@ -184,17 +265,26 @@ class TransformerBlock(nn.Module):
 
         prev_nodes = (cfg.n_heads + 1) * prev_layers + 1
         edge_mask_attentions_init = torch.ones((prev_nodes, cfg.n_heads))
-        self.edge_mask_attentions = torch.nn.Parameter(edge_mask_attentions_init, requires_grad=True)
+        self.edge_mask_attentions = torch.nn.Parameter(
+            edge_mask_attentions_init, requires_grad=True
+        )
 
-        edge_mask_mlp_init = torch.ones((prev_nodes + cfg.n_heads, ))
+        edge_mask_mlp_init = torch.ones((prev_nodes + cfg.n_heads,))
         self.edge_mask_mlp = torch.nn.Parameter(edge_mask_mlp_init, requires_grad=True)
 
     def forward(self, resid_pre, means=False):
-
         # resid_pre [batch, position, d_model, prev_head_idx]
-        masked_residuals = einsum("batch position prev_head_idx d_model, prev_head_idx n_heads -> batch position n_heads d_model", resid_pre, self.edge_mask_attentions)
+        masked_residuals = einsum(
+            "batch position prev_head_idx d_model, prev_head_idx n_heads -> batch position n_heads d_model",
+            resid_pre,
+            self.edge_mask_attentions,
+        )
         if isinstance(means, torch.Tensor):
-            masked_means = einsum("prev_head_idx d_model, prev_head_idx n_heads -> n_heads d_model", means[:self.edge_mask_attentions.shape[0]], 1 - self.edge_mask_attentions)
+            masked_means = einsum(
+                "prev_head_idx d_model, prev_head_idx n_heads -> n_heads d_model",
+                means[: self.edge_mask_attentions.shape[0]],
+                1 - self.edge_mask_attentions,
+            )
             masked_residuals = masked_residuals + masked_means
 
         # print(self.edge_mask_attentions)
@@ -210,17 +300,25 @@ class TransformerBlock(nn.Module):
 
         residual = torch.cat((resid_pre, attn_out), dim=2)
 
-        masked_mlp_residual = einsum("batch position prev_head_idx d_model, prev_head_idx -> batch position d_model", residual, self.edge_mask_mlp)
-        
+        masked_mlp_residual = einsum(
+            "batch position prev_head_idx d_model, prev_head_idx -> batch position d_model",
+            residual,
+            self.edge_mask_mlp,
+        )
+
         normalized_resid_mid = self.ln2(masked_mlp_residual)
         mlp_out = self.mlp(normalized_resid_mid)
-        mlp_out = einops.rearrange(mlp_out, "batch position d_model -> batch position 1 d_model")
+        mlp_out = einops.rearrange(
+            mlp_out, "batch position d_model -> batch position 1 d_model"
+        )
 
         residual = torch.cat((residual, mlp_out), dim=2)
 
         return residual
 
+
 """## Unembedding"""
+
 
 class Unembed(nn.Module):
     def __init__(self, cfg):
@@ -229,14 +327,24 @@ class Unembed(nn.Module):
         self.W_U = nn.Parameter(torch.empty((cfg.d_model, cfg.d_vocab)))
         nn.init.normal_(self.W_U, std=self.cfg.init_range)
         self.b_U = nn.Parameter(torch.zeros((cfg.d_vocab), requires_grad=False))
-    
+
     def forward(self, normalized_resid_final):
         # normalized_resid_final [batch, position, d_model]
-        if self.cfg.debug: print("Normalized_resid_final:", normalized_resid_final.shape)
-        logits = einsum("batch position d_model, d_model d_vocab -> batch position d_vocab", normalized_resid_final, self.W_U) + self.b_U
+        if self.cfg.debug:
+            print("Normalized_resid_final:", normalized_resid_final.shape)
+        logits = (
+            einsum(
+                "batch position d_model, d_model d_vocab -> batch position d_vocab",
+                normalized_resid_final,
+                self.W_U,
+            )
+            + self.b_U
+        )
         return logits
 
+
 """## Full Transformer"""
+
 
 class DemoTransformer(nn.Module):
     def __init__(self, cfg, means):
@@ -249,18 +357,24 @@ class DemoTransformer(nn.Module):
         for p in self.parameters():
             p.requires_grad = False
 
-        self.blocks = nn.ModuleList([TransformerBlock(cfg, i) for i in range(cfg.n_layers)])
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(cfg, i) for i in range(cfg.n_layers)]
+        )
         total_nodes = (cfg.n_heads + 1) * cfg.n_layers + 1
-        self.output_mask = torch.nn.Parameter(torch.ones((total_nodes,)), requires_grad=True)
+        self.output_mask = torch.nn.Parameter(
+            torch.ones((total_nodes,)), requires_grad=True
+        )
         self.means = means
-    
+
     def forward(self, tokens, return_states=False):
         # tokens [batch, position]
         embed = self.embed(tokens)
         pos_embed = self.pos_embed(tokens)
         residual = embed + pos_embed
-        residual = einops.rearrange(residual, "batch position d_model -> batch position 1 d_model")
-        
+        residual = einops.rearrange(
+            residual, "batch position d_model -> batch position 1 d_model"
+        )
+
         for i, block in enumerate(self.blocks):
             # print(i)
             residual = block(residual, self.means)
@@ -268,11 +382,15 @@ class DemoTransformer(nn.Module):
             #     self.saved_states = torch.cat((self.saved_states, block.saved_output.unsqueeze(0)), dim=0)
             # else:
             #     self.saved_states = block.saved_output.unsqueeze(0)
-        
+
         if return_states:
             return residual
-        
-        residual = einsum("batch position prev_head_idx d_model, prev_head_idx -> batch position d_model", residual, self.output_mask)
+
+        residual = einsum(
+            "batch position prev_head_idx d_model, prev_head_idx -> batch position d_model",
+            residual,
+            self.output_mask,
+        )
         normalized_resid_final = self.ln_final(residual)
         logits = self.unembed(normalized_resid_final)
         # logits have shape [batch, position, logits]
@@ -280,7 +398,6 @@ class DemoTransformer(nn.Module):
         #     pickle.dump(self.saved_states, f)
         return [logits]
 
-# %%
 
 # """Take a test string - the intro paragraph of today's featured Wikipedia article. Let's calculate the loss!"""
 
@@ -304,7 +421,7 @@ class DemoTransformer(nn.Module):
 # print("Loss as 'uniform over this many variables'", (loss).exp())
 # print("Uniform loss over the vocab", math.log(demo_gpt2.cfg.d_vocab))
 
-# # %% 
+#
 # """We can also greedily generate text:"""
 
 # test_string = "Breaking News: President Trump has been impeached by the House of Representatives for abuse of power and obstruction of Congress. The vote was 230 to 197, with 10 Republicans joining all Democrats in voting to impeach. The president is now only the third in American history to be impeached, and the first to be impeached twice. The House will now send the articles of impeachment to the Senate, where a trial will be held to determine whether to remove the president from office. The Senate is expected to begin the trial on"
@@ -313,5 +430,3 @@ class DemoTransformer(nn.Module):
 #     demo_logits = demo_gpt2(test_tokens)
 #     test_string += reference_gpt2.tokenizer.decode(demo_logits[-1, -1].argmax())
 # print(test_string)
-
-# %%
